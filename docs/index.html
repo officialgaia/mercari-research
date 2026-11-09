@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#fcfcfb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141413" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E">
+<title>メルカリ相場リサーチ</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>相場リサーチ</h1>
+  <span id="roBadge" class="mock" hidden>閲覧のみ</span>
+  <button id="refreshAll" class="btn small" hidden>全部更新</button>
+</header>
+
+<div id="progress" class="progress" hidden>
+  <div class="progress-text" id="progressText"></div>
+  <div class="progress-bar indeterminate"><div></div></div>
+</div>
+
+<main>
+  <!-- 初期設定（ログイン） -->
+  <section id="view-setup" class="view" hidden>
+    <h2>はじめに</h2>
+    <p class="lead">データは暗号化して保存されています。GitHubのSecretに登録したものと同じパスワードを入れてください。</p>
+    <form id="setupForm" class="form">
+      <label>パスワード<span class="req">必須</span>
+        <input name="password" type="password" required autocomplete="current-password">
+      </label>
+      <label>GitHubトークン
+        <input name="token" type="password" autocomplete="off" placeholder="github_pat_…">
+        <small>候補の追加・編集や「今すぐ更新」に必要です。見るだけなら空欄でOK。このブラウザの中にだけ保存されます</small>
+      </label>
+      <label>リポジトリ
+        <input name="repo" placeholder="officialgaia/mercari-research">
+      </label>
+      <p id="setupErr" class="err" hidden></p>
+      <div class="actions"><button type="submit" class="btn primary" id="setupBtn">はじめる</button></div>
+    </form>
+  </section>
+
+  <!-- ランキング -->
+  <section id="view-list" class="view" hidden>
+    <div class="toolbar">
+      <span class="gen" id="genAt"></span>
+      <label class="sort">並べ替え
+        <select id="sortBy">
+          <option value="verdict">判定がいい順</option>
+          <option value="profit">利益が大きい順</option>
+          <option value="sold">売れた数が多い順</option>
+          <option value="st">売れやすい順</option>
+        </select>
+      </label>
+    </div>
+    <div id="list" class="cards"></div>
+    <div id="empty" class="empty" hidden>
+      <p>まだ候補がありません。</p>
+      <p>下の「追加」から、調べたい商品のキーワードを入れてください。</p>
+      <button class="btn" data-goto="add">候補を追加する</button>
+    </div>
+  </section>
+
+  <!-- 追加・編集 -->
+  <section id="view-add" class="view" hidden>
+    <h2 id="formTitle">候補を追加</h2>
+    <p id="roNote" class="note" hidden>編集するには「設定」でGitHubトークンを入れてください。</p>
+    <form id="candForm" class="form">
+      <input type="hidden" name="cid">
+      <label>キーワード<span class="req">必須</span>
+        <input name="keyword" required maxlength="100" placeholder="例：バッグチャーム ビーズ">
+      </label>
+      <label>除外するキーワード
+        <input name="exclude" placeholder="例：ジャンク まとめ売り">
+        <small>スペース区切りで複数。関係ない商品が混ざるときに使います</small>
+      </label>
+      <label class="check"><input type="checkbox" name="new_only" checked> 「新品、未使用」だけで調べる</label>
+      <div class="row2">
+        <label>価格の下限（円）<input name="price_min" type="number" min="0" inputmode="numeric"></label>
+        <label>価格の上限（円）<input name="price_max" type="number" min="0" inputmode="numeric"></label>
+      </div>
+      <fieldset>
+        <legend>1個あたりのコスト</legend>
+        <div class="row2">
+          <label>仕入れ値
+            <input name="cost_value" type="number" min="0" step="0.01" inputmode="decimal" value="0">
+          </label>
+          <label>通貨
+            <select name="cost_currency"><option value="JPY">円</option><option value="CNY">元（人民元）</option></select>
+          </label>
+        </div>
+        <label>国際送料・代行手数料（円／個）
+          <input name="intl_yen" type="number" min="0" inputmode="numeric" value="0">
+          <small>まとめて送った送料÷個数でOK</small>
+        </label>
+        <label>国内送料（円）
+          <input name="ship_yen" type="number" min="0" inputmode="numeric" placeholder="空欄なら設定の初期値">
+        </label>
+      </fieldset>
+      <label>メモ<textarea name="memo" rows="2" placeholder="仕入れ先URLなど"></textarea></label>
+      <div class="actions">
+        <button type="submit" class="btn primary" id="saveBtn">追加して調べる</button>
+        <button type="button" class="btn" id="cancelEdit" hidden>キャンセル</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- 設定 -->
+  <section id="view-settings" class="view" hidden>
+    <h2>設定</h2>
+    <form id="settingsForm" class="form">
+      <fieldset>
+        <legend>判定の目安</legend>
+        <label>1個あたりの利益（円以上）<input name="min_profit" type="number" min="0" inputmode="numeric"></label>
+        <label>期間内に売れた数（件以上）<input name="min_sold" type="number" min="0" inputmode="numeric"></label>
+        <label>売れやすさ（以上）<input name="min_sell_through" type="number" min="0" step="0.05" inputmode="decimal">
+          <small>売れた数 ÷ 今出品されている数。高いほど競合が少なく売れやすい</small></label>
+        <label>想定売値
+          <select name="price_basis"><option value="median">売れた価格の中央値</option><option value="p25">安め（下位25%の価格）</option></select>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>お金まわり</legend>
+        <label>販売手数料（割合）<input name="fee_rate" type="number" min="0" max="1" step="0.01" inputmode="decimal">
+          <small>メルカリ・メルカリShopsとも 0.10（10%）</small></label>
+        <label>国内送料の初期値（円）<input name="default_ship" type="number" min="0" inputmode="numeric">
+          <small>らくらくメルカリ便のネコポスは210円</small></label>
+        <label>1元あたりの円<div class="inline"><input name="cny_jpy" type="number" min="0" step="0.01" inputmode="decimal">
+          <button type="button" class="btn small" id="fxBtn">為替を更新</button></div>
+          <small id="fxNote"></small></label>
+      </fieldset>
+      <fieldset>
+        <legend>取得のしかた</legend>
+        <label>売れ行きを見る期間（日）<input name="window_days" type="number" min="7" max="90" inputmode="numeric"></label>
+        <label>売り切れを何ページまで見るか<input name="max_pages" type="number" min="1" max="10" inputmode="numeric">
+          <small>1ページ120件。増やすと正確になりますが、アクセスも増えます</small></label>
+        <label>アクセスの間隔（秒）<input name="request_interval" type="number" min="1" max="30" step="0.5" inputmode="decimal">
+          <small>短くしすぎるとブロックされることがあります。2秒以上がおすすめ</small></label>
+        <p class="note">毎朝6時ごろ（日本時間）に全候補を自動で取り直します。</p>
+      </fieldset>
+      <div class="actions"><button type="submit" class="btn primary" id="saveSettings">設定を保存</button></div>
+    </form>
+
+    <div class="access">
+      <h3>接続</h3>
+      <p id="connInfo"></p>
+      <div class="btnrow">
+        <a class="btn" id="actionsLink" target="_blank" rel="noopener">実行履歴（GitHub）</a>
+        <button class="btn" id="changeConn">接続設定を変える</button>
+      </div>
+      <button class="btn danger" id="logout" style="width:100%">このブラウザからログアウト</button>
+    </div>
+  </section>
+</main>
+
+<!-- 詳細シート -->
+<div id="sheet" class="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="dTitle">
+  <div class="sheet-head">
+    <button class="icon-btn" id="sheetClose" aria-label="閉じる">‹</button>
+    <h2 id="dTitle"></h2>
+  </div>
+  <div class="sheet-body" id="detail"></div>
+</div>
+
+<nav class="tabbar" id="tabbar" hidden>
+  <button data-goto="list" class="active"><span class="ti">▤</span>ランキング</button>
+  <button data-goto="add"><span class="ti">＋</span>追加</button>
+  <button data-goto="settings"><span class="ti">⚙</span>設定</button>
+</nav>
+
+<div id="tooltip" class="tooltip" hidden></div>
+<div id="toast" class="toast" hidden></div>
+<script src="crypto.js"></script>
+<script src="evaluate.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

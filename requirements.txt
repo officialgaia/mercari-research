@@ -1,0 +1,2 @@
+mercapi>=0.5,<0.6
+cryptography>=42
