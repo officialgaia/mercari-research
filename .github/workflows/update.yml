@@ -3,15 +3,10 @@ name: メルカリ相場を取得
 on:
   schedule:
     - cron: "17 21 * * *"   # 毎日 6:17（日本時間）
-  workflow_dispatch:
-    inputs:
-      ids:
-        description: "取り直す候補のID（カンマ区切り。all で全部）"
-        required: false
-        default: "all"
+  workflow_dispatch:                     # サイトの「今すぐ調べる」
   push:
     branches: [main]
-    paths: ["docs/data/config.enc.json"]   # サイトで候補を追加・編集したとき
+    paths: ["docs/data/config.enc.json"]   # サイトでキーワードを追加したとき
 
 permissions:
   contents: write
@@ -23,7 +18,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +32,6 @@ jobs:
       - name: 取得
         env:
           DATA_PASSWORD: ${{ secrets.DATA_PASSWORD }}
-          IDS: ${{ github.event.inputs.ids }}
         run: python -m research.update
 
       - name: 結果を保存

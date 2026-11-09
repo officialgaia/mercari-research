@@ -105,6 +105,9 @@ class MercariFetcher:
         return FetchResult(sold, on_sale, int(res2.meta.num_found or 0), capped, reqs)
 
 
+MOCK_WORDS = ["パール", "パール", "パール", "くま", "くま", "リボン", "ゴールド", "シルバー", "韓国", "大人気", "花", "ハート", "ビーズ", "クリア"]
+
+
 class MockFetcher:
     """キーワードから決まった乱数でそれっぽいデータを作る。"""
 
@@ -125,9 +128,10 @@ class MockFetcher:
             updated = created + timedelta(days=rnd.uniform(0.05, 12)) if sold else created
             updated = min(updated, now)
             price = max(300, int(rnd.gauss(base, base * 0.22) // 10 * 10))
+            extra = " ".join(rnd.sample(MOCK_WORDS, 2))
             return Listing(
                 id=f"m{seed % 10**8:08d}{i:03d}",
-                name=f"{cand['keyword']} サンプル{i + 1}",
+                name=f"{cand['keyword']} {extra} 新品",
                 price=price,
                 created=created,
                 updated=updated,

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from research.analyzer import Listing, evaluate, histogram, percentile, summarize, unit_cost_yen
+from research.analyzer import Listing, extract_terms, histogram, judge, percentile, summarize
 
 NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
 
@@ -35,34 +35,35 @@ def test_summarize_falls_back_when_few_recent():
     assert m["sell_through"] == 99.0  # 出品0件で売れている＝競合なし
 
 
-def test_evaluate_profit_and_verdict():
-    metrics = {"price_median": 1000, "price_p25": 900, "sold_recent": 20, "sell_through": 0.5, "window_days": 30}
-    cand = {"cost_value": 200, "cost_currency": "JPY", "intl_yen": 100, "ship_yen": 210}
-    e = evaluate(metrics, cand, {"fee_rate": 0.10, "min_profit": 300, "min_sold": 10, "min_sell_through": 0.3})
-    # 1000 - 100(手数料) - 210 - 200 - 100 = 390
-    assert e["profit"] == 390
-    assert e["verdict"] == "go"
+def test_judge_limit_and_verdict():
+    m = {"price_median": 2000, "sold_recent": 30, "sell_through": 0.5}
+    j = judge(m, {"min_profit": 300, "intl_yen": 100, "ship_yen": 210}, 20.0)
+    # 2000 - 200(手数料) - 210 - 100 - 300 = 1190円 → 59.5元
+    assert j["limit_yen"] == 1190
+    assert j["limit_cny"] == 59.5
+    assert j["verdict"] == "go"
 
 
-def test_evaluate_p25_basis_and_cny():
-    metrics = {"price_median": 1000, "price_p25": 900, "sold_recent": 20, "sell_through": 0.5}
-    cand = {"cost_value": 10, "cost_currency": "CNY", "intl_yen": 0, "ship_yen": None}
-    s = {"price_basis": "p25", "cny_jpy": 21, "default_ship": 210}
-    assert unit_cost_yen(cand, s) == 210
-    e = evaluate(metrics, cand, s)
-    assert e["sell_price"] == 900
-    assert e["profit"] == 900 - 90 - 210 - 210
+def test_judge_maybe_and_no():
+    s = {"min_profit": 300, "intl_yen": 100, "ship_yen": 210}
+    assert judge({"price_median": 2000, "sold_recent": 6, "sell_through": 0.1}, s, 20)["verdict"] == "maybe"
+    assert judge({"price_median": 700, "sold_recent": 50, "sell_through": 1}, s, 20)["verdict"] == "no"
+    assert judge({"price_median": None}, s, 20)["verdict"] == "unknown"
 
 
-def test_evaluate_no_data():
-    e = evaluate({"price_median": None}, {}, {})
-    assert e["verdict"] == "unknown"
-
-
-def test_fee_is_floored():
-    metrics = {"price_median": 999, "sold_recent": 0, "sell_through": 0}
-    e = evaluate(metrics, {"ship_yen": 0}, {})
-    assert e["fee"] == 99
+def test_extract_terms():
+    titles = [
+        "バッグチャーム パール 新品 韓国",
+        "【新品】バッグチャーム パール リボン",
+        "バッグチャーム くま パール",
+        "バッグチャーム ビーズ リボン 匿名配送",
+        "バッグチャーム ちいかわ パール",
+        "バッグチャーム 10cm リボン",
+    ]
+    from research.seeds import BLOCK_WORDS, STOP_WORDS
+    terms = extract_terms(titles, "バッグチャーム", stop=STOP_WORDS, block=BLOCK_WORDS, top=3, min_count=2)
+    assert terms[:2] == ["パール", "リボン"]
+    assert "ちいかわ" not in terms and "新品" not in terms and "10cm" not in terms
 
 
 def test_histogram_counts_all():

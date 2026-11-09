@@ -1,59 +1,48 @@
-"""GitHub Actions から毎日／手動で実行される取得スクリプト。
+"""GitHub Actions から実行される取得スクリプト（自動発見つき）。
 
   DATA_PASSWORD=... python -m research.update
 
-- docs/data/config.enc.json   … 候補と設定（サイトから編集される）
-- docs/data/results.enc.json  … 取得結果と履歴（このスクリプトが書く）
+1. 種ジャンル（research/seeds.py）＋自分で追加したキーワードを、メルカリで調べる
+2. よく売れているジャンルの「売れた商品のタイトル」から売れ筋の言葉を拾い、
+   「ジャンル＋言葉」も調べる（例：バッグチャーム → バッグチャーム パール）
+3. 結果を暗号化して docs/data/results.enc.json に保存する
 
-どの候補を取り直すか:
-- schedule（毎日）       : 全部
-- push（サイトで編集）   : 新しく追加された候補と、検索条件が変わった候補だけ
-- workflow_dispatch      : 入力 ids で指定したもの（空なら全部）
+いつ何を調べるか:
+- schedule / workflow_dispatch : 全部（＋売れ筋の自動発見）
+- push（サイトで設定を保存）   : 新しく追加されたキーワードだけ
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
-from .analyzer import summarize
+from .analyzer import extract_terms, summarize
 from .crypto import WrongPassword, decrypt, encrypt
 from .fetcher import FetchError, MercariFetcher, MockFetcher
+from .seeds import BLOCK_WORDS, SEARCH_EXCLUDE, SEEDS, STOP_WORDS
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("DATA_DIR", ROOT / "docs" / "data"))
 CONFIG = DATA / "config.enc.json"
 RESULTS = DATA / "results.enc.json"
 
-DEFAULT_SETTINGS = {
-    "fee_rate": 0.10,
-    "default_ship": 210,
-    "cny_jpy": 21.0,
-    "price_basis": "median",
-    "min_profit": 300,
-    "min_sold": 10,
-    "min_sell_through": 0.3,
-    "window_days": 30,
-    "max_pages": 3,
-    "request_interval": 2.5,
-}
-SEARCH_KEYS = ("keyword", "exclude", "new_only", "price_min", "price_max")
-HISTORY_LIMIT = 60
+DEFAULT_SETTINGS = {"min_profit": 300, "intl_yen": 100, "ship_yen": 210}
+WINDOW_DAYS = 30
+MAX_PAGES = 2
+INTERVAL = float(os.environ.get("REQUEST_INTERVAL", "2.5"))
+EXPAND_FROM = 12      # 売れた数の上位いくつのジャンルから売れ筋語を探すか
+EXPAND_PER_SEED = 2
+EXPAND_MAX = 20
+HISTORY_LIMIT = 30
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def params_hash(c: dict, settings: dict) -> str:
-    key = {k: c.get(k) or None for k in SEARCH_KEYS}
-    key["window_days"] = settings.get("window_days")
-    key["max_pages"] = settings.get("max_pages")
-    return hashlib.sha1(json.dumps(key, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def load(path: Path, password: str, default):
@@ -67,17 +56,92 @@ def save(path: Path, obj, password: str) -> None:
     path.write_text(json.dumps(encrypt(obj, password)) + "\n", encoding="utf-8")
 
 
-def pick_targets(cands: list[dict], items: dict, settings: dict, event: str, ids_input: str) -> list[dict]:
-    if event == "push":
-        return [c for c in cands
-                if c["id"] not in items or items[c["id"]].get("params_hash") != params_hash(c, settings)]
-    if event == "workflow_dispatch" and ids_input.strip() and ids_input.strip() != "all":
-        wanted = {x.strip() for x in ids_input.split(",") if x.strip()}
-        return [c for c in cands if c["id"] in wanted]
-    return list(cands)
+def migrate(config: dict) -> dict:
+    """前のバージョン（候補を手入力する形）の設定を引き継ぐ。"""
+    config.setdefault("settings", {})
+    config.setdefault("extra_keywords", [])
+    config.setdefault("hidden", [])
+    for c in config.pop("candidates", []) or []:
+        kw = (c.get("keyword") or "").strip()
+        if kw and kw not in config["extra_keywords"]:
+            config["extra_keywords"].append(kw)
+    config["version"] = 2
+    return config
 
 
-async def run(password: str, event: str, ids_input: str, mock: bool) -> int:
+def url_1688(cn: str) -> str:
+    return "https://s.1688.com/selloffer/offer_search.htm?keywords=" + quote(cn.encode("gbk"))
+
+
+def blocked(name: str) -> bool:
+    low = name.lower()
+    return any(b.lower() in low for b in BLOCK_WORDS)
+
+
+async def fetch_rate(prev: float | None) -> tuple[float, str | None]:
+    """人民元→円（欧州中央銀行のデータ）。取れなければ前回の値。"""
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.get("https://api.frankfurter.app/latest", params={"from": "CNY", "to": "JPY"})
+            r.raise_for_status()
+            j = r.json()
+        return round(float(j["rates"]["JPY"]), 2), j.get("date")
+    except Exception as e:
+        print(f"為替を取得できませんでした（前回の値を使います）: {e}")
+        return prev or 21.0, None
+
+
+class Runner:
+    def __init__(self, fetcher, items: dict):
+        self.fetcher = fetcher
+        self.items = items
+        self.titles: dict[str, list[str]] = {}
+        self.ok = 0
+        self.tried = 0
+
+    async def check(self, keyword: str, *, cn: str | None, source: str, parent: str | None = None):
+        self.tried += 1
+        prev = self.items.get(keyword, {})
+        cand = {"keyword": keyword, "exclude": SEARCH_EXCLUDE, "new_only": True}
+        print(f"- {keyword} … ", end="", flush=True)
+        try:
+            res = await self.fetcher.fetch(cand, window_days=WINDOW_DAYS, max_pages=MAX_PAGES)
+        except FetchError as e:
+            print(f"失敗: {e}")
+            if prev:
+                self.items[keyword] = {**prev, "error": str(e)}
+            return
+        sold = [x for x in res.sold if not blocked(x.name)]
+        on_sale = [x for x in res.on_sale if not blocked(x.name)]
+        m = summarize(sold, on_sale, res.on_sale_total, window_days=WINDOW_DAYS, sold_capped=res.sold_capped)
+        m.pop("histogram", None)
+        ts = now_iso()
+        recent = sorted(sold, key=lambda x: x.updated, reverse=True)
+        self.titles[keyword] = [x.name for x in recent[:120]]
+        hist = prev.get("history", []) + [{"at": ts, "sold": m["sold_recent"], "price": m["price_median"]}]
+        self.items[keyword] = {
+            "keyword": keyword,
+            "cn": cn,
+            "url_1688": url_1688(cn) if cn else None,
+            "source": source,
+            "parent": parent,
+            "fetched_at": ts,
+            "metrics": m,
+            "samples": [
+                {"id": x.id, "name": x.name, "price": x.price, "thumbnail": x.thumbnail, "sold_at": x.updated.isoformat()}
+                for x in recent[:8]
+            ],
+            "history": hist[-HISTORY_LIMIT:],
+            "error": None,
+        }
+        self.ok += 1
+        print(f"売れた{m['sold_recent']}件 / 相場{m['price_median']}円 / 出品中{m['on_sale_total']}件")
+        await asyncio.sleep(self.fetcher.interval)
+
+
+async def run(password: str, event: str, mock: bool) -> int:
     try:
         config = load(CONFIG, password, None)
         results = load(RESULTS, password, {"items": {}})
@@ -85,65 +149,68 @@ async def run(password: str, event: str, ids_input: str, mock: bool) -> int:
         print(f"::error::{e}（Secrets の DATA_PASSWORD とサイトで入れたパスワードが同じか確認してください）")
         return 1
 
-    if config is None:
-        config = {"version": 1, "settings": dict(DEFAULT_SETTINGS), "candidates": []}
+    created = config is None
+    config = migrate(config or {"settings": dict(DEFAULT_SETTINGS)})
+    old_format = any("keyword" not in v for v in results.get("items", {}).values())
+    if created or old_format:
+        results = {"items": {}}  # 前のバージョンの結果は形が違うので作り直す
+    if created:
         save(CONFIG, config, password)
-        print("設定ファイルがなかったので、空の設定を作りました")
 
-    settings = {**DEFAULT_SETTINGS, **config.get("settings", {})}
-    cands = config.get("candidates", [])
-    items: dict = results.get("items", {})
+    hidden = set(config["hidden"])
+    extras = [k for k in config["extra_keywords"] if k not in hidden]
+    seeds = [(k, cn) for k, cn in SEEDS if k not in hidden]
+    old_items: dict = results.get("items", {})
+    fetcher = MockFetcher(interval=0.05) if mock else MercariFetcher(interval=INTERVAL)
 
-    # 削除された候補の結果は消す
-    alive = {c["id"] for c in cands}
-    removed = [cid for cid in items if cid not in alive]
-    for cid in removed:
-        del items[cid]
+    if event == "push":
+        # 設定の保存で動いたとき：新しく追加したキーワードだけ調べる
+        items = dict(old_items)
+        r = Runner(fetcher, items)
+        for kw in extras:
+            if kw not in items:
+                await r.check(kw, cn=None, source="user")
+        for kw in list(items):
+            if kw in hidden or (items[kw].get("source") == "user" and kw not in extras):
+                del items[kw]
+        if r.tried == 0 and items.keys() == old_items.keys():
+            print("調べ直すものはありません")
+            return 0
+        cny, fx_date = results.get("cny_jpy", 21.0), results.get("fx_date")
+    else:
+        cny, fx_date = await fetch_rate(results.get("cny_jpy")) if not mock else (20.5, "mock")
+        r = Runner(fetcher, dict(old_items))  # 前回のデータ（履歴）を引き継ぐ
+        cn_of = dict(seeds)
+        print(f"■ ジャンル {len(seeds)}件 ＋ 追加キーワード {len(extras)}件")
+        for kw, cn in seeds:
+            await r.check(kw, cn=cn, source="seed")
+        for kw in extras:
+            if kw not in cn_of:
+                await r.check(kw, cn=None, source="user")
+        checked = {kw for kw, _ in seeds} | set(extras)
 
-    targets = pick_targets(cands, items, settings, event, ids_input)
-    print(f"イベント: {event or 'local'} / 対象 {len(targets)}件 / 全 {len(cands)}件")
+        # 売れ筋語の自動発見
+        top = sorted(
+            (k for k in checked if k in r.items and r.items[k].get("metrics") and not r.items[k].get("error")),
+            key=lambda k: -r.items[k]["metrics"]["sold_recent"],
+        )[:EXPAND_FROM]
+        found: list[tuple[str, str]] = []
+        for k in top:
+            terms = extract_terms(r.titles.get(k, []), k, stop=STOP_WORDS, block=BLOCK_WORDS, top=EXPAND_PER_SEED)
+            for t in terms:
+                kw = f"{k} {t}"
+                if kw not in hidden and kw not in checked and len(found) < EXPAND_MAX:
+                    found.append((kw, k))
+        print(f"■ 売れ筋から見つけたキーワード {len(found)}件")
+        for kw, parent in found:
+            await r.check(kw, cn=cn_of.get(parent), source="found", parent=parent)
+        keep = checked | {kw for kw, _ in found}
+        items = {k: v for k, v in r.items.items() if k in keep and k not in hidden}
 
-    fetcher = MockFetcher() if mock else MercariFetcher(interval=float(settings["request_interval"]))
-    ok = 0
-    for n, c in enumerate(targets, 1):
-        print(f"[{n}/{len(targets)}] {c['keyword']} … ", end="", flush=True)
-        prev = items.get(c["id"], {})
-        try:
-            res = await fetcher.fetch(c, window_days=int(settings["window_days"]), max_pages=int(settings["max_pages"]))
-            m = summarize(res.sold, res.on_sale, res.on_sale_total,
-                          window_days=int(settings["window_days"]), sold_capped=res.sold_capped)
-            recent_sold = sorted(res.sold, key=lambda x: x.updated, reverse=True)[:40]
-            cheapest = sorted(res.on_sale, key=lambda x: x.price)[:10]
-            ts = now_iso()
-            history = prev.get("history", []) + [{
-                "fetched_at": ts,
-                "sold_recent": m["sold_recent"],
-                "price_median": m["price_median"],
-                "on_sale_total": m["on_sale_total"],
-            }]
-            items[c["id"]] = {
-                "fetched_at": ts,
-                "params_hash": params_hash(c, settings),
-                "metrics": m,
-                "samples": [x.to_dict() for x in recent_sold + cheapest],
-                "history": history[-HISTORY_LIMIT:],
-                "error": None,
-            }
-            ok += 1
-            print(f"売れた{m['sold_recent']}件 / 中央値{m['price_median']}円 / 出品中{m['on_sale_total']}件")
-        except FetchError as e:
-            items[c["id"]] = {**prev, "error": str(e), "error_at": now_iso()}
-            print(f"失敗: {e}")
-        if n < len(targets):
-            await asyncio.sleep(0.2 if mock else float(settings["request_interval"]))
-
-    if not targets and not removed:
-        print("取り直す候補はありません")
-        return 0
-    results = {"generated_at": now_iso(), "items": items}
+    results = {"generated_at": now_iso(), "cny_jpy": cny, "fx_date": fx_date, "items": items}
     save(RESULTS, results, password)
-    print(f"完了: 成功 {ok} / 対象 {len(targets)}")
-    if targets and ok == 0:
+    print(f"完了: 成功 {r.ok} / {r.tried}")
+    if r.tried and r.ok == 0:
         print("::warning::すべての取得に失敗しました。メルカリ側でブロックされているか、仕様が変わった可能性があります")
     return 0
 
@@ -153,13 +220,7 @@ def main() -> None:
     if not password:
         print("::error::DATA_PASSWORD が設定されていません（Settings → Secrets and variables → Actions）")
         sys.exit(1)
-    code = asyncio.run(run(
-        password,
-        os.environ.get("GITHUB_EVENT_NAME", ""),
-        os.environ.get("IDS", ""),
-        os.environ.get("MOCK") == "1",
-    ))
-    sys.exit(code)
+    sys.exit(asyncio.run(run(password, os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("MOCK") == "1")))
 
 
 if __name__ == "__main__":

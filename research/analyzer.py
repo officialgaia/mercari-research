@@ -129,87 +129,83 @@ def summarize(
     }
 
 
-def evaluate(metrics: dict, cand: dict, settings: dict) -> dict:
-    """相場の指標と、候補ごとのコスト・設定から利益と判定を出す。
-
-    コストや設定を変えても再取得せずに計算し直せるよう、表示のたびに呼ぶ。
-    """
-    fee_rate = float(settings.get("fee_rate", 0.10))
-    basis = settings.get("price_basis", "median")  # median / p25（控えめ）
-    price = metrics.get("price_p25") if basis == "p25" else metrics.get("price_median")
-
-    cost = unit_cost_yen(cand, settings)
-    intl = int(cand.get("intl_yen") or 0)
-    ship = int(cand.get("ship_yen") if cand.get("ship_yen") is not None else settings.get("default_ship", 210))
-
-    result: dict = {
-        "sell_price": price,
-        "unit_cost": cost,
-        "intl": intl,
-        "ship": ship,
-        "fee": None,
-        "profit": None,
-        "margin": None,
-        "roi": None,
-        "verdict": "unknown",
-        "reasons": [],
-    }
-    if price is None:
-        result["reasons"].append("売れた実績が見つからず、相場を出せません")
-        return result
-
-    fee = math.floor(price * fee_rate)  # メルカリは端数切り捨て
-    profit = price - fee - ship - cost - intl
-    result.update(
-        fee=fee,
-        profit=profit,
-        margin=round(profit / price, 3) if price else None,
-        roi=round(profit / (cost + intl), 3) if (cost + intl) > 0 else None,
-    )
-
-    min_profit = int(settings.get("min_profit", 300))
-    min_sold = int(settings.get("min_sold", 10))
-    min_st = float(settings.get("min_sell_through", 0.3))
-    sold = int(metrics.get("sold_recent") or 0)
-    st = metrics.get("sell_through")
-
-    ok_profit = profit >= min_profit
-    ok_sold = sold >= min_sold
-    ok_st = st is not None and st >= min_st
-    reasons = result["reasons"]
-    if cost + intl == 0:
-        reasons.append("仕入れ値が未入力なので、利益は手数料と送料だけ引いた金額です")
-    reasons.append(
-        f"{'✓' if ok_profit else '✗'} 1個あたりの利益 {profit:,}円（目安 {min_profit:,}円以上）"
-    )
-    reasons.append(
-        f"{'✓' if ok_sold else '✗'} 直近{metrics.get('window_days', 30)}日の売れた数 "
-        f"{sold}{'件以上' if metrics.get('sold_capped') else '件'}（目安 {min_sold}件以上）"
-    )
-    st_txt = "—" if st is None else f"{st:.2f}"
-    reasons.append(f"{'✓' if ok_st else '✗'} 売れやすさ {st_txt}（売れた数÷出品中の数、目安 {min_st}以上）")
-
-    if ok_profit and ok_sold and ok_st:
-        verdict = "go"
-    elif profit >= min_profit * 0.5 and sold >= max(1, min_sold // 2):
-        verdict = "maybe"
-    else:
-        verdict = "no"
-    result["verdict"] = verdict
-    return result
-
-
-def unit_cost_yen(cand: dict, settings: dict) -> int:
-    """仕入れ単価を円に直す（元で入力された場合は為替レートで換算）。"""
-    value = float(cand.get("cost_value") or 0)
-    if cand.get("cost_currency") == "CNY":
-        return round(value * float(settings.get("cny_jpy", 21.0)))
-    return round(value)
-
-
 def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _round(x: float | None) -> int | None:
     return None if x is None else int(round(x))
+
+
+# ---------------------------------------------------------------- 自動発見用
+
+import re
+import unicodedata
+
+_SPLIT = re.compile(r"[\s\u3000【】\[\]()（）{}「」『』<>＜＞/／・|｜,，、。.!！?？#＃★☆♪♡❤✨◆◇■□●○*＊~〜～:：;；\-_=+＋&＆'\"“”]+")
+
+
+def extract_terms(titles: list[str], seed: str, *, stop: set[str], block: list[str],
+                  top: int = 2, min_ratio: float = 0.12, min_count: int = 3) -> list[str]:
+    """売れた商品のタイトルから、よく出てくる言葉（＝売れ筋の特徴）を拾う。
+
+    例：「バッグチャーム」の売れた商品に「パール」が多ければ「パール」を返す。
+    1つのタイトルで同じ言葉は1回と数える。
+    """
+    seed_parts = {unicodedata.normalize("NFKC", w).lower() for w in seed.split()}
+    block_l = [b.lower() for b in block]
+    stop_l = {w.lower() for w in stop}
+    counts: dict[str, int] = {}
+    shown: dict[str, str] = {}
+    for t in titles:
+        seen = set()
+        for raw in _SPLIT.split(unicodedata.normalize("NFKC", t)):
+            w = raw.strip()
+            key = w.lower()
+            if not (2 <= len(w) <= 12) or key in seen:
+                continue
+            if key in stop_l or key.isdigit() or re.fullmatch(r"[0-9a-z]{1,2}", key):
+                continue
+            if any(sp in key or key in sp for sp in seed_parts):
+                continue
+            if any(b in key for b in block_l):
+                continue
+            if re.fullmatch(r"[0-9.]+(cm|mm|m|g|個|枚|本|色|点|セット)?", key):
+                continue
+            seen.add(key)
+            counts[key] = counts.get(key, 0) + 1
+            shown.setdefault(key, w)
+    need = max(min_count, int(len(titles) * min_ratio))
+    ranked = sorted((k for k, c in counts.items() if c >= need), key=lambda k: (-counts[k], k))
+    return [shown[k] for k in ranked[:top]]
+
+
+def judge(metrics: dict, settings: dict, cny_jpy: float) -> dict:
+    """相場から「いくら以下で仕入れれば目標の利益が出るか」と判定を出す。
+
+    ブラウザ側（docs/evaluate.js）と同じ計算。変えるときは両方そろえる。
+    """
+    fee_rate = float(settings.get("fee_rate", 0.10))
+    ship = int(settings.get("ship_yen", 210))
+    intl = int(settings.get("intl_yen", 100))
+    min_profit = int(settings.get("min_profit", 300))
+    min_sold = int(settings.get("min_sold", 15))
+    min_st = float(settings.get("min_sell_through", 0.3))
+    price = metrics.get("price_median")
+    out = {"price": price, "fee": None, "limit_yen": None, "limit_cny": None, "verdict": "unknown"}
+    if price is None:
+        return out
+    fee = math.floor(price * fee_rate)
+    limit = price - fee - ship - intl - min_profit
+    out["fee"] = fee
+    out["limit_yen"] = limit
+    out["limit_cny"] = math.floor(limit * 10 / cny_jpy) / 10 if cny_jpy > 0 else None
+    sold = int(metrics.get("sold_recent") or 0)
+    st = metrics.get("sell_through")
+    if sold >= min_sold and st is not None and st >= min_st and limit >= 150:
+        out["verdict"] = "go"
+    elif sold >= max(1, min_sold // 3) and limit >= 50:
+        out["verdict"] = "maybe"
+    else:
+        out["verdict"] = "no"
+    return out
