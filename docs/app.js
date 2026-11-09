@@ -83,7 +83,7 @@ async function gh(path, { method = "GET", body, raw = false } = {}) {
   return raw ? res.text() : res.json();
 }
 function ghErrorText(status, msg) {
-  if (status === 401) return "GitHubトークンが無効か、期限切れです";
+  if (status === 401) return "GitHubトークンが無効か、期限切れです（作り直した場合は新しいトークンを貼ってください）";
   if (status === 403) return `権限が足りません（トークンの権限を確認してください）${msg ? "：" + msg : ""}`;
   if (status === 404) return "リポジトリかファイルが見つかりません（名前とトークンの対象リポジトリを確認）";
   if (status === 409 || status === 422) return "ほかの端末で同時に更新されました。もう一度やり直してください";
@@ -670,12 +670,17 @@ $("#setupForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const f = ev.target;
   state.password = f.password.value;
-  state.token = f.token.value.trim();
+  // 貼り付けで混ざりやすい空白・改行・見えない文字を取り除く
+  state.token = f.token.value.replace(/[\s​-‍⁠﻿]/g, "");
+  f.token.value = state.token;
   state.repo = f.repo.value.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\/$/, "");
   $("#setupBtn").disabled = true;
   $("#setupBtn").textContent = "確認中…";
   try {
     if (state.token) {
+      if (!/^(github_pat_|ghp_)[A-Za-z0-9_]+$/.test(state.token)) {
+        throw new Error(`トークンの形が正しくありません（github_pat_ で始まる英数字のはずです。今は${state.token.length}文字）`);
+      }
       if (!state.repo) throw new Error("リポジトリを入れてください（例：officialgaia/mercari-research）");
       const repo = await gh(`/repos/${state.repo}`);
       if (!repo.permissions?.push) throw new Error("このトークンではリポジトリに書き込めません");
