@@ -24,7 +24,7 @@ from urllib.parse import quote
 from .analyzer import extract_terms, summarize
 from .crypto import WrongPassword, decrypt, encrypt
 from .fetcher import FetchError, MercariFetcher, MockFetcher
-from .seeds import BLOCK_WORDS, SEARCH_EXCLUDE, SEEDS, STOP_WORDS
+from .seeds import BLOCK_WORDS, NOT_FOR_SALE, SEARCH_EXCLUDE, SEEDS, STOP_WORDS
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("DATA_DIR", ROOT / "docs" / "data"))
@@ -74,8 +74,9 @@ def url_1688(cn: str) -> str:
 
 
 def blocked(name: str) -> bool:
+    """相場に入れない出品：キャラクター・ブランド物と、専用出品・まとめ売りなど。"""
     low = name.lower()
-    return any(b.lower() in low for b in BLOCK_WORDS)
+    return any(b.lower() in low for b in BLOCK_WORDS) or bool(NOT_FOR_SALE.search(name))
 
 
 async def fetch_rate(prev: float | None) -> tuple[float, str | None]:

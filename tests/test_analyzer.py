@@ -71,3 +71,14 @@ def test_histogram_counts_all():
     h = histogram(vals)
     assert sum(b["count"] for b in h) == len(vals)
     assert all(b["to"] > b["from"] for b in h)
+
+
+def test_not_for_sale_titles():
+    from research.update import blocked
+    for t in ["田中様専用 バッグチャーム", "バッグチャーム 〇〇様", "【専用】ヘアクリップ", "専用 コサージュ 2点",
+              "ヘアクリップ まとめ売り 10個", "おまとめ ビーズ", "さま専用", "ピアス 様 専用", "ブローチ 専用です",
+              "シール 大量 セット", "お取り置き中 ポーチ", "ポーチ（専用）"]:
+        assert blocked(t), t
+    for t in ["バッグチャーム 花模様 パール", "同様の商品あります ヘアクリップ", "iPhone専用ケース スマホリング",
+              "トレカ専用 硬質ケース 10枚", "コサージュ 仕様 卒業式"]:
+        assert not blocked(t), t
